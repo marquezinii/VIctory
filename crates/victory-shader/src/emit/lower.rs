@@ -8160,9 +8160,9 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let st = self.x.st;
-                // A number joined in (a constant before a branch) only where
-                // the join was checked to hold per lane.
-                let checked = st.active.contains(&phi.value) || st.outside.contains(&phi.value);
+                // A number joined in (a constant before a branch or a loop)
+                // only where the join was checked to hold per lane.
+                let checked = st.per_lane_joins.contains(&phi.value);
                 let m = *st
                     .masks
                     .get(&arg)

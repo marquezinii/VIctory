@@ -294,3 +294,68 @@ fn a_mask_both_arms_write_is_refused() {
     let e = lowered(&program(&body)).err().expect("lowered");
     assert!(e.to_string().contains("lane mask"), "{e}");
 }
+
+const fn sopc(op: u32, src0: u32, src1: u32) -> u32 {
+    0xBF00_0000 | op << 16 | src1 << 8 | src0
+}
+const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
+    0x7C00_0000 | op << 17 | vsrc1 << 9 | src0
+}
+/// A scalar branch `words` back or forward from the next instruction.
+const fn sopp(op: u32, words: i16) -> u32 {
+    0xBF80_0000 | op << 16 | words as u16 as u32
+}
+
+/// `s20 |= (v0 == s21)` while s21 counts up from 0, then EXEC restored
+/// and `tail`. The loop runs three times in every lane (`s_cmp_lt_u32
+/// s21, 3; s_cbranch_scc1`), or with `narrow` until no lane is above s21
+/// (`v_cmpx_lt_u32 exec_lo, s21, v0; s_cbranch_execnz`).
+fn accumulating_loop(narrow: bool, tail: &[u32]) -> Vec<u32> {
+    let mut body = vec![
+        s_mov_b32(20, 0x80),
+        s_mov_b32(21, 0x80),
+        s_mov_b32(6, EXEC_LO),
+        vopc(0xC2, 21, 0),        // v_cmp_eq_u32 vcc_lo, s21, v0
+        s_or_b32(20, 20, VCC_LO), // s20 |= vcc_lo
+        sop2(0x02, 21, 21, 0x81), // s_add_i32 s21, s21, 1
+    ];
+    if narrow {
+        // Lanes above s21 go round again: a lane leaves after its own pass.
+        body.push(vopc(0xD1, 21, 0)); // v_cmpx_lt_u32 exec_lo, s21, v0
+        body.push(sopp(0x09, -5)); // s_cbranch_execnz
+    } else {
+        body.push(sopc(0x0A, 21, 0x83)); // s_cmp_lt_u32 s21, 3
+        body.push(sopp(0x05, -5)); // s_cbranch_scc1
+    }
+    body.push(s_mov_b32(EXEC_LO, 6));
+    body.extend_from_slice(tail);
+    program(&body)
+}
+
+/// A mask built up over a loop that every lane runs as many times: each
+/// pass ORs in the lane the counter names.
+#[test]
+fn a_mask_built_up_in_a_uniform_loop_reads_as_a_number() {
+    let shader = build(&accumulating_loop(false, &[v_mov_b32(1, 20)]));
+    check(&shader, &[0x7; LANES]);
+}
+
+/// The same loop counted with `s_bcnt1_i32_b32`.
+#[test]
+fn a_mask_built_up_in_a_uniform_loop_counts_its_lanes() {
+    let shader = build(&accumulating_loop(
+        false,
+        &[s_bcnt1_i32_b32(4, 20), v_mov_b32(1, 4)],
+    ));
+    check(&shader, &[3; LANES]);
+}
+
+/// When lanes leave the loop after different passes, the wave's s20 keeps
+/// growing after a lane has left, so a lane's own copy is not the wave's.
+#[test]
+fn a_mask_built_up_in_a_loop_lanes_leave_apart_is_refused() {
+    let e = lowered(&accumulating_loop(true, &[v_mov_b32(1, 20)]))
+        .err()
+        .expect("lowered");
+    assert!(e.to_string().contains("mask"), "{e}");
+}

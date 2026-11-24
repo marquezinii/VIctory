@@ -322,6 +322,10 @@ pub struct Structured {
     /// The lane's bit of other values read as masks (constants, numbers),
     /// by their low dword's value: what a mask join takes in from them.
     pub numbers: HashMap<Value, Bool>,
+    /// Joins (phi values) where every lane's own incoming value is the
+    /// wave's: forward joins checked edge by edge, and the joins at the
+    /// head of a loop that every lane runs the same way.
+    pub per_lane_joins: HashSet<Value>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -374,6 +378,8 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::outside`].
     outside: HashSet<Value>,
+    /// See [`Structured::per_lane_joins`].
+    per_lane_joins: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -438,6 +444,7 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             outside: HashSet::new(),
+            per_lane_joins: HashSet::new(),
         })
     }
 
@@ -451,6 +458,7 @@ impl<'a> Lanes<'a> {
         self.when.fill(None);
         self.active.clear();
         self.outside.clear();
+        self.per_lane_joins.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -563,11 +571,16 @@ impl<'a> Lanes<'a> {
                 (self.index[block] < first_loop).then_some((k, block, m))
             })
             .collect();
+        for header in self.uniform_loops() {
+            let values = self.p.blocks[header].phis.iter().map(|phi| phi.value);
+            self.per_lane_joins.extend(values);
+        }
         for (k, block, m) in joins {
-            if self.active.contains(&k.0)
-                || self.outside.contains(&k.0)
-                || !self.per_lane(k, block, cond)
-            {
+            if !self.per_lane(k, block, cond) {
+                continue;
+            }
+            self.per_lane_joins.extend([k.0, k.1]);
+            if self.active.contains(&k.0) || self.outside.contains(&k.0) {
                 continue;
             }
             let there = cond[block];
@@ -578,6 +591,45 @@ impl<'a> Lanes<'a> {
                 self.outside.insert(k.0);
             }
         }
+    }
+
+    /// The heads of loops that every lane runs the same way: no branch in
+    /// the loop depends on the lane (a scalar counter, an SCC test), so each
+    /// lane goes round as often as the wave and enters the head over the
+    /// wave's edge.
+    fn uniform_loops(&self) -> Vec<usize> {
+        let p = self.p;
+        let mut heads = Vec::new();
+        for (i, &head) in self.order.iter().enumerate() {
+            let latches = self.incoming[head]
+                .iter()
+                .filter(|&&(q, _)| self.index[q] >= i)
+                .map(|&(q, _)| q);
+            let mut body = HashSet::from([head]);
+            let mut work: Vec<usize> = latches.collect();
+            if work.is_empty() {
+                continue;
+            }
+            while let Some(b) = work.pop() {
+                if body.insert(b) {
+                    work.extend(p.blocks[b].preds.iter().copied());
+                }
+            }
+            let same_way = body.iter().all(|&b| match p.blocks[b].exit {
+                Exit::Branch { .. } => self.when[b].is_some_and(|w| {
+                    self.b
+                        .support(w)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+                }),
+                Exit::Indirect => false,
+                Exit::Jump(_) | Exit::End => true,
+            });
+            if same_way {
+                heads.push(head);
+            }
+        }
+        heads
     }
 
     /// Whether every lane's own incoming mask at join `k` is the wave's.
@@ -684,6 +736,7 @@ impl<'a> Lanes<'a> {
             active: self.active,
             outside: self.outside,
             numbers: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            per_lane_joins: self.per_lane_joins,
             bools: self.b,
             exits,
             guards,
