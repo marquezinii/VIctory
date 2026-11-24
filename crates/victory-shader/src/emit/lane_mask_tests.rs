@@ -3,6 +3,10 @@
 //! programs lowered to DXIL, validated by `dxil.dll` when present, and run
 //! on the host GPU and WARP against the console's result, lane by lane.
 
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
+
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -165,8 +169,24 @@ fn build(words: &[u32]) -> HostShader {
     shader
 }
 
+/// Whether `host` can run waves of 32 lanes (`WaveSize(32)`).
+fn runs_32_lane_waves(host: &Host) -> bool {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: `o` is the structure D3D12_FEATURE_D3D12_OPTIONS1 fills, of
+    // the size given.
+    let read = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut o).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+        )
+    };
+    read.is_ok() && o.WaveOps.as_bool() && (o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&32)
+}
+
 /// Runs `shader` on the hardware GPU and on WARP (each skipped without a
-/// device) and checks that every lane stored `want[lane]`.
+/// device that runs 32-lane waves) and checks that every lane stored
+/// `want[lane]`.
 fn check(shader: &HostShader, want: &[u32; LANES]) {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -176,16 +196,15 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = match host.compute_pipeline(shader) {
-            Ok(p) => p,
-            // A mask read as a number needs the console's wave size,
-            // which WARP does not run.
-            Err(e) if warp => {
-                eprintln!("skipped on WARP: {e}");
-                continue;
-            }
-            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
-        };
+        // A mask read as a number needs the console's wave size of 32,
+        // which WARP and some adapters do not run.
+        if !runs_32_lane_waves(&host) {
+            eprintln!("{label}: no 32-lane waves; skipped");
+            continue;
+        }
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let views = [View::RawUav(LANES as u32)];
         let words = host
